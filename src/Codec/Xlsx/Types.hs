@@ -23,6 +23,7 @@ module Codec.Xlsx.Types (
     -- * Lenses
     -- ** Workbook
     , xlSheets
+    , xlExternalReferences
     , xlStyles
     , xlDefinedNames
     , xlCustomProperties
@@ -219,6 +220,7 @@ instance NFData Styles
 -- | Structured representation of Xlsx file (currently a subset of its contents)
 data Xlsx = Xlsx
   { _xlSheets :: [(Text, Worksheet)]
+  , _xlExternalReferences :: Map Text (FilePath, [(Text, CellMap)])
   , _xlStyles :: Styles
   , _xlDefinedNames :: DefinedNames
   , _xlCustomProperties :: Map Text Variant
@@ -259,7 +261,7 @@ instance NFData DefinedNames
 makeLenses ''Xlsx
 
 instance Default Xlsx where
-    def = Xlsx [] emptyStyles def M.empty DateBase1900
+    def = Xlsx [] M.empty emptyStyles def M.empty DateBase1900
 
 instance Default DefinedNames where
     def = DefinedNames []

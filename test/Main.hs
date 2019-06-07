@@ -87,7 +87,7 @@ main = defaultMain $
     ]
 
 testXlsx :: Xlsx
-testXlsx = Xlsx sheets minimalStyles definedNames customProperties DateBase1904
+testXlsx = Xlsx sheets extRefs minimalStyles definedNames customProperties DateBase1904
   where
     sheets =
       [("List1", sheet1), ("Another sheet", sheet2), ("with pivot table", pvSheet)]
@@ -179,6 +179,8 @@ testXlsx = Xlsx sheets minimalStyles definedNames customProperties DateBase1904
              , cfRule (CellIs (OpBetween (Formula "A1") (Formula "B10"))) 3
              ]
     rules2 = [ cfRule ContainsErrors 3 ]
+    extRefs = M.fromList []
+              -- M.fromList [("1", ("file:///referee.xlsb", [("Sheet1", M.fromList [((1,1),Cell {_cellStyle = Nothing, _cellValue = Just (CellDouble 1.0), _cellComment = Nothing, _cellFormula = Nothing})])]))]
 
 testCellMap1 :: CellMap
 testCellMap1 = M.fromList [ ((1, 2), cd1_2), ((1, 5), cd1_5), ((1, 10), cd1_10)

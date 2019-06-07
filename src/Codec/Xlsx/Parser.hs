@@ -71,6 +71,7 @@ data ParseError = InvalidZipArchive
                 | InvalidFile FilePath Text
                 | InvalidRef FilePath RefId
                 | InconsistentXlsx Text
+                | BadExternalReference
                 deriving (Eq, Show, Generic)
 
 instance Exception ParseError
@@ -104,17 +105,22 @@ toXlsxEitherBase parseSheet bs = do
   ar <- left (const InvalidZipArchive) $ Zip.toArchiveOrFail bs
   sst <- getSharedStrings ar
   contentTypes <- getContentTypes ar
-  (wfs, names, cacheSources, dateBase) <- readWorkbook ar
+  (wfs, erfs, names, cacheSources, dateBase) <- readWorkbook ar
   sheets <- forM wfs $ \wf -> do
       sheet <- parseSheet ar sst contentTypes cacheSources wf
       return (wfName wf, sheet)
+  externalReferences <- forM erfs $ extractExternalReference ar
   CustomProperties customPropMap <- getCustomProperties ar
-  return $ Xlsx sheets (getStyles ar) names customPropMap dateBase
+  return $ Xlsx sheets (M.fromList externalReferences) (getStyles ar) names customPropMap dateBase
 
 data WorksheetFile = WorksheetFile { wfName :: Text
                                    , wfPath :: FilePath
                                    }
                    deriving (Show, Generic)
+
+data ExternalReferenceFile = ExternalReferenceFile { erfPath :: FilePath
+                                   }
+                deriving (Show, Generic)
 
 type Caches = [(CacheId, (Text, CellRef, [CacheField]))]
 
@@ -480,6 +486,46 @@ extractSheet ar sst contentTypes caches wf = do
       mProtection
       sharedFormulas
 
+extractExternalReference ::
+     Zip.Archive
+  -> ExternalReferenceFile
+  -> Parser (Text, (FilePath, [(Text, CellMap)]))
+extractExternalReference ar wf = do
+  let filePath = erfPath wf
+  externalReferenceRels <- getExternalReferenceRels ar filePath
+  file <- note (MissingFile filePath) $ Zip.fromEntry <$> Zip.findEntryByPath filePath ar
+  cur <- fmap fromDocument . left (\ex -> InvalidFile filePath (T.pack $ show ex)) $
+         parseLBS def file
+  let sheetNameList = cur $/ element (n_ "externalBook") &/ element (n_ "sheetNames") &/
+        element (n_ "sheetName") >=> attribute "val"
+  rId <- fmap RefId $ note BadExternalReference $ listToMaybe $ cur $/
+    element (n_ "externalBook") >=> laxAttribute "id"
+  fp <- note BadExternalReference $ relTarget <$> Relationships.lookup rId externalReferenceRels
+  let sheetNameMap = M.fromList $ zip [0::Integer ..] sheetNameList
+  let sheetDatas = cur $/ element (n_ "externalBook") &/ element (n_ "sheetDataSet") &/
+        element (n_ "sheetData")
+  let cellMaps = mconcat $ parseSheetData <$> sheetDatas
+  let sheetNames = (`M.lookup` sheetNameMap) . fst <$> cellMaps
+  sheetNames' <- bool (Right [x | (Just x) <- sheetNames]) (Left BadExternalReference)
+    (any isNothing sheetNames)
+  erId <- getId filePath
+  return (erId, (fp, zip sheetNames' (snd <$> cellMaps)))
+  where
+    parseCell cell = do
+        ref <- fromAttribute "r" cell
+        let t = fromMaybe "n" $ listToMaybe $ cell $| attribute "t"
+            d = listToMaybe $ extractCellValue sstEmpty t cell
+            (r, c) = fromSingleCellRefNoting ref
+        return ((r, c), Cell Nothing d Nothing Nothing)
+    parseSheetData c = do
+      sheetId :: Integer <- (runIdentity . decimal) <$> fromAttribute "sheetId" c
+      let rows = c $/ element (n_ "row") &/ element (n_ "cell") >=> parseCell
+      return (sheetId, M.fromList rows)
+    getId fp = do
+      let (_, file) = splitFileName fp
+      note BadExternalReference $ join $ T.stripPrefix "externalLink" <$>
+        T.stripSuffix ".xml" (T.pack file)
+
 extractCellValue :: SharedStringTable -> Text -> Cursor -> [CellValue]
 extractCellValue sst t cur
   | t == "s" = do
@@ -614,7 +660,7 @@ readChart :: Zip.Archive -> FilePath -> Parser ChartSpace
 readChart ar path = fromFileCursor ar path "chart"
 
 -- | readWorkbook pulls the names of the sheets and the defined names
-readWorkbook :: Zip.Archive -> Parser ([WorksheetFile], DefinedNames, Caches, DateBase)
+readWorkbook :: Zip.Archive -> Parser ([WorksheetFile], [ExternalReferenceFile], DefinedNames, Caches, DateBase)
 readWorkbook ar = do
   let wbPath = "xl/workbook.xml"
   cur <- xmlCursorRequired ar wbPath
@@ -634,6 +680,10 @@ readWorkbook ar = do
     cur $/ element (n_ "sheets") &/ element (n_ "sheet") >=>
     liftA2 (worksheetFile wbPath wbRels) <$> attribute "name" <*>
     fromAttribute (odr "id")
+  externalReferences <-
+    sequence $
+    cur $/ element (n_ "externalReferences") &/ element (n_ "externalReference") >=>
+    liftA (fmap ExternalReferenceFile . lookupRelPath wbPath wbRels) <$> fromAttribute (odr "id")
   let cacheRefs =
         cur $/ element (n_ "pivotCaches") &/ element (n_ "pivotCache") >=>
         liftA2 (,) <$> fromAttribute "cacheId" <*> fromAttribute (odr "id")
@@ -658,7 +708,7 @@ readWorkbook ar = do
       return $ (cacheId, (sheet, ref, fields))
   let dateBase = bool DateBase1900 DateBase1904 . fromMaybe False . listToMaybe $
                  cur $/ element (n_ "workbookPr") >=> fromAttribute "date1904"
-  return (sheets, DefinedNames names, caches, dateBase)
+  return (sheets, externalReferences, DefinedNames names, caches, dateBase)
 
 getTable :: Zip.Archive -> FilePath -> Parser Table
 getTable ar fp = do
@@ -675,6 +725,13 @@ getRels ar fp = do
         relsPath = dir </> "_rels" </> file <.> "rels"
     c <- xmlCursorOptional ar relsPath
     return $ maybe Relationships.empty (setTargetsFrom fp . headNote "Missing rels" . fromCursor) c
+
+getExternalReferenceRels :: Zip.Archive -> FilePath -> Parser Relationships
+getExternalReferenceRels ar fp = do
+    let (dir, file) = splitFileName fp
+        relsPath = dir </> "_rels" </> file <.> "rels"
+    c <- xmlCursorOptional ar relsPath
+    return $ maybe Relationships.empty (headNote "Missing rels" . fromCursor) c
 
 lookupRelPath :: FilePath
               -> Relationships
